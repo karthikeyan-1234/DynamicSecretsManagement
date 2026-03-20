@@ -1,0 +1,65 @@
+# ------------------------------------------------------------
+# Secret containing StripeOptions configuration
+# ------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: stripe-config
+type: Opaque
+stringData:
+  # Note: The double underscore __ is the convention for hierarchical keys in .NET
+  StripeOptions__SecretKey: "sk_test_initial_1234567890"
+  StripeOptions__PublishableKey: "pk_test_initial_1234567890"
+  StripeOptions__MaxRetries: "5"
+---
+# ------------------------------------------------------------
+# Deployment for the DynamicSecretsManagement app
+# ------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dynamic-secrets-app
+  labels:
+    app: dynamic-secrets-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dynamic-secrets-app
+  template:
+    metadata:
+      labels:
+        app: dynamic-secrets-app
+    spec:
+      containers:
+        - name: app
+          image: dynamic-secrets-app:v2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+              name: http
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: "Development"
+            - name: ASPNETCORE_URLS
+              value: "http://+:80"
+          # Inject all keys from the stripe-config secret as environment variables
+          envFrom:
+            - secretRef:
+                name: stripe-config
+---
+# ------------------------------------------------------------
+# Service to expose the app internally
+# ------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: dynamic-secrets-app-service
+spec:
+  type: ClusterIP
+  selector:
+    app: dynamic-secrets-app
+  ports:
+    - port: 80
+      targetPort: 80
+      name: http
