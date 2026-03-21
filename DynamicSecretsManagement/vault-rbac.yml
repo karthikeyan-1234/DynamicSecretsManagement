@@ -1,0 +1,69 @@
+# ==============================================================
+# vault-rbac.yml
+#
+# Kubernetes RBAC resources required for Vault integration.
+# Safe to commit to source control — contains no secret values.
+#
+# Apply with:
+#   kubectl apply -f vault-rbac.yml
+#
+# What this creates:
+#
+#   1. ServiceAccount  — identity used by your app pod and by
+#                        the Vault Agent sidecar to authenticate
+#                        with Vault via Kubernetes auth method.
+#
+#   2. ClusterRoleBinding — grants Vault's own SA (vault:default)
+#                        permission to call the Kubernetes
+#                        TokenReview API so it can verify SA
+#                        tokens presented by app pods.
+#
+# Apply order:
+#   1. vault-infrastructure.yml  (Vault running)
+#   2. vault-rbac.yml            ← this file
+#   3. vault-init-job.yml        (Vault internals configured)
+#   4. deployment-vault-agent.yml (app deployed)
+# ==============================================================
+
+
+# --------------------------------------------------------------
+# 1. ServiceAccount for your app
+#
+# This SA is:
+#   - Assigned to the app pod via serviceAccountName
+#   - Bound to a Vault role inside vault-init-job.yml
+#   - Used by Vault Agent sidecar to authenticate with Vault
+#
+# The name must match:
+#   - bound_service_account_names in vault-init-job.yml
+#   - serviceAccountName in deployment-vault-agent.yml
+# --------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dynamic-secrets-sa
+  namespace: default
+
+
+---
+# --------------------------------------------------------------
+# 2. ClusterRoleBinding — TokenReview permission for Vault
+#
+# Vault verifies incoming SA tokens by calling the K8s
+# TokenReview API. system:auth-delegator is a built-in
+# ClusterRole that grants exactly this — nothing more.
+#
+# Bound to vault:default (Vault's own pod SA).
+# --------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vault-tokenreview-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind:      ClusterRole
+  name:      system:auth-delegator
+subjects:
+  - kind:      ServiceAccount
+    name:      default
+    namespace: vault

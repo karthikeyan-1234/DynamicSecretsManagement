@@ -1,0 +1,246 @@
+# ==============================================================
+# vault-init-job.yml
+#
+# A Kubernetes Job that configures Vault internals after Vault
+# has been initialized and unsealed.
+#
+# Safe to commit to source control — contains NO secret values.
+# Only infrastructure configuration (auth methods, policies,
+# roles, secret engine paths).
+#
+# What this Job does (all idempotent — safe to re-run):
+#   1. Enables Kubernetes auth method
+#   2. Configures Kubernetes auth (CA cert + reviewer token)
+#   3. Writes the app policy (read-only on stripe-config path)
+#   4. Writes the Kubernetes auth role
+#   5. Enables KV v2 secrets engine at path "secret/"
+#
+# What this Job does NOT do:
+#   - Write actual secret values (vault kv put)
+#     → Do this manually or via CI/CD (see guide)
+#
+# Pre-requisites:
+#   1. Vault is initialized and unsealed
+#   2. vault-rbac.yml has been applied
+#   3. Root token stored as a K8s Secret (one-time manual step):
+#
+#      kubectl create secret generic vault-root-token \
+#        --from-literal=token=hvs.YOUR_ROOT_TOKEN_HERE \
+#        -n vault
+#
+#      Delete it after the job succeeds:
+#      kubectl delete secret vault-root-token -n vault
+#
+# Apply with:
+#   kubectl apply -f vault-init-job.yml
+#
+# Monitor:
+#   kubectl get job vault-init -n vault
+#   kubectl logs -n vault -l job-name=vault-init
+#
+# Re-run if needed (delete job first):
+#   kubectl delete job vault-init -n vault
+#   kubectl apply -f vault-init-job.yml
+# ==============================================================
+
+
+# --------------------------------------------------------------
+# ServiceAccount for the init Job
+# Needs access to its own mounted SA token (for step 2)
+# --------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault-init-sa
+  namespace: vault
+
+
+---
+# --------------------------------------------------------------
+# The init Job
+# --------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vault-init
+  namespace: vault
+  labels:
+    app: vault-init
+spec:
+  # Do not retry on failure — fix the error and re-apply
+  backoffLimit: 0
+
+  # Clean up completed/failed job pods after 10 minutes
+  ttlSecondsAfterFinished: 600
+
+  template:
+    spec:
+      serviceAccountName: vault-init-sa
+      restartPolicy: Never
+
+      # Wait for Vault to be ready before running
+      initContainers:
+        - name: wait-for-vault
+          image: hashicorp/vault:1.19.0
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Waiting for Vault to be ready..."
+              until vault status 2>&1 | grep -q "Sealed.*false"; do
+                echo "  Vault not ready yet (sealed or unreachable) — retrying in 5s"
+                sleep 5
+              done
+              echo "Vault is ready."
+          env:
+            - name: VAULT_ADDR
+              value: "http://vault.vault.svc.cluster.local:8200"
+
+      containers:
+        - name: vault-init
+          image: hashicorp/vault:1.19.0
+          env:
+            - name: VAULT_ADDR
+              value: "http://vault.vault.svc.cluster.local:8200"
+
+            # Root token is read from the vault-root-token K8s Secret.
+            # You create this secret manually after unsealing:
+            #   kubectl create secret generic vault-root-token \
+            #     --from-literal=token=hvs.YOUR_TOKEN \
+            #     -n vault
+            # Delete it after this job completes successfully.
+            - name: VAULT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: vault-root-token
+                  key: token
+
+          # SA token and CA cert from this pod's own mount —
+          # used in step 2 to configure K8s auth
+          volumeMounts:
+            - name: kube-sa
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+
+              echo "================================================"
+              echo " Vault Init Job — configuring Vault internals"
+              echo "================================================"
+
+              # --------------------------------------------------
+              # Step 1: Enable Kubernetes auth method
+              # '|| true' makes it idempotent — already-enabled
+              # path returns an error but we continue safely.
+              # --------------------------------------------------
+              echo ""
+              echo "Step 1: Enabling Kubernetes auth method..."
+              vault auth enable kubernetes 2>&1 || true
+              echo "  Done."
+
+              # --------------------------------------------------
+              # Step 2: Configure Kubernetes auth
+              # Uses this pod's own CA cert and SA token so Vault
+              # can call the K8s TokenReview API to verify tokens
+              # from app pods.
+              # --------------------------------------------------
+              echo ""
+              echo "Step 2: Configuring Kubernetes auth..."
+              vault write auth/kubernetes/config \
+                kubernetes_host="https://kubernetes.default.svc.cluster.local:443" \
+                kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+                token_reviewer_jwt=@/var/run/secrets/kubernetes.io/serviceaccount/token
+              echo "  Done."
+
+              # --------------------------------------------------
+              # Step 3: Write the app policy
+              # Grants read-only access to exactly one secret path.
+              # Nothing else is accessible with this policy.
+              # --------------------------------------------------
+              echo ""
+              echo "Step 3: Writing dynamic-secrets-policy..."
+              vault policy write dynamic-secrets-policy - <<'EOF'
+              path "secret/data/stripe-config" {
+                capabilities = ["read"]
+              }
+              EOF
+              echo "  Done."
+
+              # --------------------------------------------------
+              # Step 4: Write the Kubernetes auth role
+              # Binds the app's ServiceAccount (dynamic-secrets-sa
+              # in default namespace) to the policy above.
+              # TTL of 1h means tokens auto-renew every hour.
+              # --------------------------------------------------
+              echo ""
+              echo "Step 4: Writing dynamic-secrets-role..."
+              vault write auth/kubernetes/role/dynamic-secrets-role \
+                bound_service_account_names=dynamic-secrets-sa \
+                bound_service_account_namespaces=default \
+                policies=dynamic-secrets-policy \
+                ttl=1h
+              echo "  Done."
+
+              # --------------------------------------------------
+              # Step 5: Enable KV v2 secrets engine
+              # This is infrastructure config — no secret values.
+              # '|| true' makes it idempotent.
+              # NOTE: vault kv put (writing actual secrets) is NOT
+              # done here — see guide for that manual step.
+              # --------------------------------------------------
+              echo ""
+              echo "Step 5: Enabling KV v2 secrets engine at path 'secret/'..."
+              vault secrets enable -path=secret kv-v2 2>&1 || true
+              echo "  Done."
+
+              # --------------------------------------------------
+              # Verification
+              # --------------------------------------------------
+              echo ""
+              echo "================================================"
+              echo " Verification"
+              echo "================================================"
+              echo ""
+              echo "Auth methods:"
+              vault auth list
+              echo ""
+              echo "Secret engines:"
+              vault secrets list
+              echo ""
+              echo "Policy — dynamic-secrets-policy:"
+              vault policy read dynamic-secrets-policy
+              echo ""
+              echo "Role — dynamic-secrets-role:"
+              vault read auth/kubernetes/role/dynamic-secrets-role
+              echo ""
+              echo "================================================"
+              echo " Vault init complete."
+              echo " NEXT STEP: store your actual secrets manually:"
+              echo ""
+              echo "   kubectl exec -n vault -it <vault-pod> -- vault login"
+              echo "   kubectl exec -n vault -it <vault-pod> -- vault kv put \\"
+              echo "     secret/stripe-config \\"
+              echo "     SecretKey=sk_test_... \\"
+              echo "     PublishableKey=pk_test_... \\"
+              echo "     MaxRetries=25"
+              echo ""
+              echo " Then delete the root token secret:"
+              echo "   kubectl delete secret vault-root-token -n vault"
+              echo "================================================"
+
+      volumes:
+        - name: kube-sa
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
