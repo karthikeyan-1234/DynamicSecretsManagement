@@ -1,0 +1,231 @@
+# ==============================================================
+# deployment-vault-agent.yml
+#
+# Replaces deployment-volumeMount.yml entirely.
+#
+# What changed from the previous deployment:
+#   1. serviceAccountName → dynamic-secrets-sa
+#      (required for Vault Kubernetes auth)
+#
+#   2. K8s Secret + stripe-secret-volume removed
+#      (Vault Agent writes the file instead)
+#
+#   3. vault-agent-config ConfigMap added
+#      (Agent config + appsettings.json template)
+#
+#   4. Vault Agent init container added
+#      (renders the file BEFORE the app starts — ensures
+#       StripeOptions are available on first request)
+#
+#   5. shared-secrets emptyDir volume added
+#      (Agent writes here, app reads from here)
+#
+# The app's Program.cs polling provider watches
+# /app/secrets/appsettings.json — unchanged, already
+# compatible with Vault Agent file writes.
+#
+# Apply with:
+#   kubectl apply -f deployment-vault-agent.yml
+# ==============================================================
+
+
+# --------------------------------------------------------------
+# ConfigMap — Vault Agent configuration + template
+#
+# Two files baked in:
+#   agent-config.hcl  — tells the Agent how to authenticate
+#                       with Vault and where to write files
+#   appsettings.tmpl  — Vault template that renders
+#                       appsettings.json from KV secrets
+# --------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vault-agent-config
+  namespace: default
+data:
+
+  agent-config.hcl: |
+    # Trust the Kubernetes service account token for auth
+    auto_auth {
+      method "kubernetes" {
+        mount_path = "auth/kubernetes"
+        config = {
+          role = "dynamic-secrets-role"
+        }
+      }
+
+      # Vault Agent caches the token here inside the shared volume
+      sink "file" {
+        config = {
+          path = "/app/secrets/.vault-token"
+        }
+      }
+    }
+
+    # Run in exit-after-auth=false (daemon) mode so the agent
+    # keeps watching Vault and re-renders the file whenever
+    # the secret changes.
+    vault {
+      address = "http://vault.vault.svc.cluster.local:8200"
+    }
+
+    # Template block — renders appsettings.json from Vault KV
+    template {
+      source      = "/vault/templates/appsettings.tmpl"
+      destination = "/app/secrets/appsettings.json"
+
+      # Tells the agent to re-render and write the file
+      # whenever the secret version changes in Vault.
+      # The polling provider in Program.cs picks this up
+      # within ~4 seconds.
+      wait {
+        min = "2s"
+        max = "10s"
+      }
+    }
+
+  appsettings.tmpl: |
+    {{- with secret "secret/data/stripe-config" -}}
+    {
+      "StripeOptions": {
+        "SecretKey":      "{{ .Data.data.SecretKey }}",
+        "PublishableKey": "{{ .Data.data.PublishableKey }}",
+        "MaxRetries":     {{ .Data.data.MaxRetries }}
+      }
+    }
+    {{- end }}
+
+
+---
+# --------------------------------------------------------------
+# Deployment — DynamicSecretsManagement app
+# with Vault Agent sidecar
+# --------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dynamic-secrets-app
+  labels:
+    app: dynamic-secrets-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dynamic-secrets-app
+  template:
+    metadata:
+      labels:
+        app: dynamic-secrets-app
+    spec:
+      # Must match the bound_service_account_names in Vault role
+      serviceAccountName: dynamic-secrets-sa
+
+      # --------------------------------------------------------
+      # Init container — Vault Agent runs once before the app
+      # starts, authenticates with Vault, renders
+      # appsettings.json into /app/secrets, then exits.
+      #
+      # This guarantees the file exists when the app container
+      # starts — StripeOptions validation won't fail on boot.
+      # --------------------------------------------------------
+      initContainers:
+        - name: vault-agent-init
+          image: hashicorp/vault:1.19.0
+          args:
+            - agent
+            - -config=/vault/config/agent-config.hcl
+            - -exit-after-auth=true   # run once then exit
+          env:
+            - name: VAULT_LOG_LEVEL
+              value: "info"
+          volumeMounts:
+            - name: vault-agent-config
+              mountPath: /vault/config
+            - name: vault-templates
+              mountPath: /vault/templates
+            - name: shared-secrets
+              mountPath: /app/secrets
+
+      containers:
+        # ------------------------------------------------------
+        # Main app container
+        # ------------------------------------------------------
+        - name: app
+          image: dynamic-secrets-app:v4
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+              name: http
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: "Development"
+            - name: ASPNETCORE_URLS
+              value: "http://+:80"
+          volumeMounts:
+            - name: shared-secrets
+              mountPath: /app/secrets
+              readOnly: true
+
+        # ------------------------------------------------------
+        # Vault Agent sidecar — runs as a daemon alongside app
+        # Re-renders appsettings.json whenever the secret
+        # version changes in Vault.
+        # The app's polling provider detects the new file
+        # and reloads IConfiguration within ~4 seconds.
+        # ------------------------------------------------------
+        - name: vault-agent
+          image: hashicorp/vault:1.19.0
+          args:
+            - agent
+            - -config=/vault/config/agent-config.hcl
+          env:
+            - name: VAULT_LOG_LEVEL
+              value: "info"
+          volumeMounts:
+            - name: vault-agent-config
+              mountPath: /vault/config
+            - name: vault-templates
+              mountPath: /vault/templates
+            - name: shared-secrets
+              mountPath: /app/secrets
+
+      volumes:
+        # Agent HCL config
+        - name: vault-agent-config
+          configMap:
+            name: vault-agent-config
+            items:
+              - key: agent-config.hcl
+                path: agent-config.hcl
+
+        # Jinja/Go template for appsettings.json
+        - name: vault-templates
+          configMap:
+            name: vault-agent-config
+            items:
+              - key: appsettings.tmpl
+                path: appsettings.tmpl
+
+        # Shared emptyDir between init container, sidecar,
+        # and app — this is where appsettings.json lives
+        - name: shared-secrets
+          emptyDir: {}
+
+
+---
+# --------------------------------------------------------------
+# Service — unchanged
+# --------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: dynamic-secrets-app-service
+spec:
+  type: ClusterIP
+  selector:
+    app: dynamic-secrets-app
+  ports:
+    - port: 80
+      targetPort: 80
+      name: http

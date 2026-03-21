@@ -1,5 +1,5 @@
 # ------------------------------------------------------------
-# Secret containing StripeOptions configuration as environment variables
+# Secret containing StripeOptions configuration as a JSON file
 # ------------------------------------------------------------
 apiVersion: v1
 kind: Secret
@@ -7,10 +7,15 @@ metadata:
   name: stripe-config
 type: Opaque
 stringData:
-  # Note: The double underscore __ is the convention for hierarchical keys in .NET
-  StripeOptions__SecretKey: "sk_test_initial_1234567890"
-  StripeOptions__PublishableKey: "pk_test_initial_1234567890"
-  StripeOptions__MaxRetries: "5"
+  # This will be mounted as a file named "appsettings.json"
+  appsettings.json: |
+    {
+      "StripeOptions": {
+        "SecretKey": "sk_test_initial_1234567890",
+        "PublishableKey": "pk_test_initial_1234567890",
+        "MaxRetries": 30
+      }
+    }
 ---
 # ------------------------------------------------------------
 # Deployment for the DynamicSecretsManagement app
@@ -33,7 +38,7 @@ spec:
     spec:
       containers:
         - name: app
-          image: dynamic-secrets-app:v2
+          image: dynamic-secrets-app:v5
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 80
@@ -43,10 +48,15 @@ spec:
               value: "Development"
             - name: ASPNETCORE_URLS
               value: "http://+:80"
-          # Inject all keys from the stripe-config secret as environment variables
-          envFrom:
-            - secretRef:
-                name: stripe-config
+          # Mount the secret as a volume
+          volumeMounts:
+            - name: stripe-secret-volume
+              mountPath: /app/secrets
+              readOnly: true
+      volumes:
+        - name: stripe-secret-volume
+          secret:
+            secretName: stripe-config
 ---
 # ------------------------------------------------------------
 # Service to expose the app internally

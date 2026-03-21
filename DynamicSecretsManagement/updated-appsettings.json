@@ -7,8 +7,8 @@
   },
   "AllowedHosts": "*",
   "StripeOptions": {
-    "SecretKey": "DeVsSecretKey",
-    "PublishableKey": "DevVsPubKey",
-    "MaxRetries": "15"
+    "SecretKey": "sk_test_initial_1234567890",
+    "PublishableKey": "pk_test_initial_1234567890",
+    "MaxRetries": 25
   }
 }
