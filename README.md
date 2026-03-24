@@ -1,27 +1,68 @@
-##Architectural Summary##
-This project is a .NET 9 ASP.NET Core Web API that demonstrates dynamic secret management patterns on Kubernetes, progressing from basic to production-leaning approaches.
+## Architectural Overview
 
-At system level, the core objective is to prove how application configuration (specifically StripeOptions) behaves under different secret delivery mechanisms, and how quickly the app can reflect rotations at runtime.
+This project showcases **dynamic secret management patterns** in a .NET 9 ASP.NET Core Web API deployed on Kubernetes. It progresses from basic environment variables to production-grade Vault Agent sidecars, proving how applications handle secret rotation at runtime.
 
-#What The Solution Achieves
-Validates three secret delivery models
-Env-var injection (deployment-minimal.yaml) for baseline simplicity.
-Kubernetes Secret volume mount (deployment-volumeMount.yml) for file-based secret refresh.
-HashiCorp Vault Agent sidecar (deployment-vault-agent.yml) for dynamic, continuously rendered secrets.
-Demonstrates runtime config reloading semantics
-Uses IOptions, IOptionsSnapshot, and IOptionsMonitor in PaymentController to show stale vs refreshed values.
-Uses polling file provider in Program.cs to detect mounted secret file updates.
-Shows platform bootstrap for Vault on Kubernetes
-Infra + RBAC + init automation in vault-infrastructure.yml, vault-rbac.yml, vault-init-job.yml.
-Establishes Vault Kubernetes auth path and policy-based access to secret paths.
-Provides containerized deployment path
-Docker multi-stage build (Dockerfile) and K8s manifests for different runtime modes.
-Functional Scope (Current)
-API capability
-/api/payment: returns effective Stripe retry config through different options lifetimes.
-/weatherforecast: template endpoint (non-core).
-Configuration behavior
-Layered config from appsettings.json + mounted /app/secrets/appsettings.json.
-Startup validation via options binding and data annotations.
-Deployment variants
-Supports learning/demo progression from static secret injection to dynamic sidecar-driven rotation.
+## Core Objectives
+
+- ✅ **Validate 3 secret delivery models** with runtime reload behavior
+- ✅ **Demonstrate .NET configuration lifetimes** (IOptions → IOptionsMonitor)
+- ✅ **Bootstrap production Vault infrastructure** on Kubernetes
+- ✅ **Prove zero-downtime secret rotation** capabilities
+
+## Secret Management Patterns
+
+| Pattern | Manifest | Refresh Mechanism | Use Case |
+|---------|----------|------------------|----------|
+| **Env Vars** | `deployment-minimal.yaml` | Pod restart | Learning baseline |
+| **Volume Mount** | `deployment-volumeMount.yaml` | File polling | File-based refresh |
+| **Vault Agent** | `deployment-vault-agent.yaml` | Sidecar streaming | Production rotation |
+
+## Key Features Demonstrated
+
+### 🔄 Runtime Configuration Reload
+
+```csharp
+// PaymentController showcases all patterns
+[HttpGet("payment")]
+public IActionResult GetPaymentConfig()
+{
+    var config1 = _options.Value;           // IOptions (stale)
+    var config2 = _optionsSnapshot.Value;   // IOptionsSnapshot (pod scope)
+    var config3 = _optionsMonitor.CurrentValue; // IOptionsMonitor (live)
+    // Returns active Stripe retry config
+}
+```
+appsettings.json
+└── /app/secrets/appsettings.json (mounted)
+    └── Stripe:SecretKey (rotatable)
+    
+###☸️ Vault Kubernetes Bootstrap
+Infra: vault-infrastructure.yaml (server deployment)
+
+RBAC: vault-rbac.yaml (service account + auth path)
+
+Init: vault-init-job.yaml (unseal + KVv2 setup)
+
+| Endpoint             | Purpose                                      |
+| -------------------- | -------------------------------------------- |
+| GET /api/payment     | Returns live Stripe config (proves rotation) |
+| GET /weatherforecast | .NET template endpoint                       |
+
+# 1. Start Minikube/k3s
+minikube start
+
+# 2. Deploy Vault infrastructure
+kubectl apply -f vault-*.yml
+
+# 3. Test progression
+kubectl apply -f deployment-minimal.yaml         # Static env
+kubectl apply -f deployment-volumeMount.yaml     # File refresh
+kubectl apply -f deployment-vault-agent.yaml     # Dynamic sidecar
+
+### Deployment Progression
+Static Env Vars → Volume Mount Polling → Vault Agent Sidecar
+     ↓                ↓                     ↓
+  Simple           File-based          Production-grade
+ Learning         refresh             zero-downtime
+
+Try it: Rotate secrets and watch /api/payment reflect changes instantly without restarts!
