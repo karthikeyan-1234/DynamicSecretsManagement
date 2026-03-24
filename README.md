@@ -1,4 +1,4 @@
-#Architectural Summary
+##Architectural Summary##
 This project is a .NET 9 ASP.NET Core Web API that demonstrates dynamic secret management patterns on Kubernetes, progressing from basic to production-leaning approaches.
 
 At system level, the core objective is to prove how application configuration (specifically StripeOptions) behaves under different secret delivery mechanisms, and how quickly the app can reflect rotations at runtime.
